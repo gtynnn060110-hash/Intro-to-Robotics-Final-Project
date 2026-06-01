@@ -16,7 +16,7 @@ conda activate robot_proj   # Python 3.10, Apple Silicon (ARM64)
 
 Dependencies: `mujoco` (3.x native, NOT mujoco-py), `gymnasium`, `stable-baselines3`, `wandb`, `moviepy`
 
-Robot model lives in `mujoco_menagerie/unitree_a1/` (cloned separately from google-deepmind/mujoco_menagerie).
+Robot model lives in `final_project/unitree_a1/` (local copy for terrain edits).
 
 ## Running Scripts
 
@@ -31,7 +31,7 @@ mjpython train.py             # Run RL training (when implemented)
 
 The project follows a standard RL pipeline:
 
-1. **MuJoCo model** (`mujoco_menagerie/unitree_a1/scene.xml`) — physics description of the A1 robot with ground plane, lighting, and contacts
+1. **MuJoCo model** (`final_project/unitree_a1/scene.xml`) — physics description of the A1 robot with ground plane, lighting, and contacts (local copy for terrain edits)
 2. **Gymnasium environment** (to be built) — wraps `mujoco.MjModel`/`MjData` into a `gymnasium.Env` with:
    - Action space: 12 continuous joint target angles (PD-controlled)
    - Observation space: proprioceptive state (trunk quaternion, angular velocity, 12× joint angle + velocity)

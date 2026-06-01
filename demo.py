@@ -5,8 +5,8 @@ import time
 import os
 
 # 1. 指定机器狗的物理描述文件路径
-# 这里使用的是带场景（地板、光照）的完整 A1 模型
-xml_path = "mujoco_menagerie/unitree_a1/scene.xml"
+# 这里使用的是带场景（地板、光照）的完整 A1 模型（本仓库本地副本）
+xml_path = "unitree_a1/scene.xml"
 
 # 检查文件是否存在，防止路径配错
 if not os.path.exists(xml_path):
@@ -15,6 +15,13 @@ if not os.path.exists(xml_path):
 # 2. 核心操作：将 XML 编译为 MuJoCo 物理模型，并初始化数据状态
 model = mujoco.MjModel.from_xml_path(xml_path)
 data = mujoco.MjData(model)
+try:
+    home_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    if home_id >= 0:
+        mujoco.mj_resetDataKeyframe(model, data, home_id)
+        mujoco.mj_forward(model, data)
+except Exception:
+    pass
 
 print("🤖 机器狗加载成功！")
 print("👉 隐藏玩法：在弹出的窗口中，用鼠标【双击】狗的身体，然后按住【右键】可以旋转视角，按住【Ctrl + 鼠标左键】可以像上帝之手一样把它拎起来摔在地上！")
