@@ -18,7 +18,8 @@ class UnitreeA1Env(gym.Env):
     - Expects the model XML path passed as `model_path`.
     - Actions are 12 normalized joint target offsets in [-1,1].
     - The XML uses MuJoCo position actuators, so `data.ctrl` receives target joint angles.
-    - Observation vector: trunk quaternion, trunk velocities, height error, joint pos/vel => 35 dims.
+    - Observation vector: trunk quaternion, trunk velocities, height error, joint pos/vel,
+      previous action => 47 dims.
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
@@ -35,6 +36,10 @@ class UnitreeA1Env(gym.Env):
         task: str = "stand",
         max_episode_steps: int = 1000,
         recovery_prob: float = 0.0,
+        recovery_difficulty: float = 0.25,
+        normalize_obs: bool = False,
+        success_steps: int = 15,
+        failure_steps: int = 60,
         contact_solref=(0.004, 1.0),
         contact_solimp=(0.9, 0.95, 0.001, 0.5, 2.0),
     ):
@@ -64,6 +69,19 @@ class UnitreeA1Env(gym.Env):
         self.current_task = self.task
         self.max_episode_steps = int(max_episode_steps)
         self.recovery_prob = float(recovery_prob)
+        self.recovery_difficulty = float(np.clip(recovery_difficulty, 0.0, 1.0))
+        self.recovery_difficulty_min = self.recovery_difficulty
+        self.recovery_difficulty_max = self.recovery_difficulty
+        self.current_recovery_difficulty = self.recovery_difficulty
+        self.hard_reset_prob = 0.0
+        self.hard_reset_upright_min = 0.0
+        self.hard_reset_upright_max = 0.5
+        self.hard_reset_sampled = False
+        self.initial_upright = 0.0
+        self.initial_height_error = 0.0
+        self.normalize_obs = bool(normalize_obs)
+        self.success_steps_required = int(success_steps)
+        self.failure_steps_limit = int(failure_steps)
         self.contact_solref = np.array(contact_solref, dtype=np.float64)
         self.contact_solimp = np.array(contact_solimp, dtype=np.float64)
         self._configure_contact_params()
@@ -72,18 +90,55 @@ class UnitreeA1Env(gym.Env):
         self.ctrl_low, self.ctrl_high = self._get_ctrl_range()
         self.nominal_base_clearance = self._compute_nominal_base_clearance()
         self.last_action = np.zeros(self.n_joints, dtype=np.float32)
+        self.success_steps = 0
+        self.failure_steps = 0
+        self.prev_upright = 0.0
+        self.prev_abs_height_error = 0.0
         self.steps = 0
 
         # action: normalized offsets from the terrain-aware standing pose
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.n_joints,), dtype=np.float32)
 
-        # observation dims: quat(4) + ang vel(3) + lin vel(3) + height error(1) + 12 pos + 12 vel
-        obs_dim = 4 + 3 + 3 + 1 + self.n_joints + self.n_joints
+        # observation dims: quat(4) + ang vel(3) + lin vel(3) + height error(1)
+        # + 12 pos + 12 vel + previous action(12)
+        obs_dim = 4 + 3 + 3 + 1 + self.n_joints + self.n_joints + self.n_joints
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
-        self.obs_normalizer = Normalizer(obs_dim)
+        self.obs_normalizer = Normalizer(obs_dim) if self.normalize_obs else None
 
         self._viewer = None
+
+    def set_recovery_difficulty(self, difficulty: float):
+        self.recovery_difficulty = float(np.clip(difficulty, 0.0, 1.0))
+        self.recovery_difficulty_min = self.recovery_difficulty
+        self.recovery_difficulty_max = self.recovery_difficulty
+        self.current_recovery_difficulty = self.recovery_difficulty
+
+    def set_recovery_difficulty_range(self, min_difficulty: float, max_difficulty: float):
+        low = float(np.clip(min_difficulty, 0.0, 1.0))
+        high = float(np.clip(max_difficulty, 0.0, 1.0))
+        if high < low:
+            low, high = high, low
+        self.recovery_difficulty_min = low
+        self.recovery_difficulty_max = high
+        self.recovery_difficulty = high
+
+    def _sample_recovery_difficulty(self):
+        if self.recovery_difficulty_max <= self.recovery_difficulty_min:
+            difficulty = self.recovery_difficulty_max
+        else:
+            difficulty = self.np_random.uniform(self.recovery_difficulty_min, self.recovery_difficulty_max)
+        self.current_recovery_difficulty = float(np.clip(difficulty, 0.0, 1.0))
+        return self.current_recovery_difficulty
+
+    def set_hard_reset_oversampling(self, probability: float, upright_min: float = 0.0, upright_max: float = 0.5):
+        self.hard_reset_prob = float(np.clip(probability, 0.0, 1.0))
+        low = float(np.clip(upright_min, -1.0, 1.0))
+        high = float(np.clip(upright_max, -1.0, 1.0))
+        if high < low:
+            low, high = high, low
+        self.hard_reset_upright_min = low
+        self.hard_reset_upright_max = high
 
     def _get_joint_indices(self):
         # Heuristic: assume the last n_joints qpos/qvel entries correspond to actuated joints
@@ -318,24 +373,43 @@ class UnitreeA1Env(gym.Env):
     def _apply_recovery_randomization(self):
         terrain_z = self._terrain_height_under_base()
         rng = self.np_random
+        difficulty = self._sample_recovery_difficulty()
+        self.hard_reset_sampled = bool(self.hard_reset_prob > 0.0 and rng.random() < self.hard_reset_prob)
 
-        if rng.random() < 0.45:
-            roll = rng.uniform(-math.pi, math.pi)
-            pitch = rng.uniform(-1.1, 1.1)
-            base_height = rng.uniform(0.10, 0.22)
-        else:
-            roll = rng.uniform(-0.9, 0.9)
-            pitch = rng.uniform(-0.7, 0.7)
-            base_height = rng.uniform(0.20, 0.34)
-        yaw = rng.uniform(-math.pi, math.pi)
+        quat = None
+        roll = pitch = yaw = base_height = 0.0
+        max_attempts = 50 if self.hard_reset_sampled else 1
+        for _ in range(max_attempts):
+            if difficulty > 0.75 and rng.random() < 0.30:
+                roll = rng.uniform(-math.pi, math.pi)
+                pitch = rng.uniform(-1.1, 1.1)
+                base_height = rng.uniform(0.10, 0.22)
+            else:
+                roll_range = 0.25 + 2.9 * difficulty
+                pitch_range = 0.20 + 0.90 * difficulty
+                base_low = max(0.10, 0.27 - 0.17 * difficulty)
+                base_high = max(base_low + 0.03, 0.34 - 0.02 * difficulty)
+                roll = rng.uniform(-roll_range, roll_range)
+                pitch = rng.uniform(-pitch_range, pitch_range)
+                base_height = rng.uniform(base_low, base_high)
+            yaw = rng.uniform(-math.pi, math.pi)
+            quat = self._quat_from_euler(roll, pitch, yaw)
+            sampled_upright = float(self._body_z_axis(quat)[2])
+            if (
+                not self.hard_reset_sampled
+                or self.hard_reset_upright_min <= sampled_upright <= self.hard_reset_upright_max
+            ):
+                break
+        if quat is None:
+            quat = self._quat_from_euler(roll, pitch, yaw)
 
         self.data.qpos[2] = terrain_z + base_height
-        self.data.qpos[3:7] = self._quat_from_euler(roll, pitch, yaw)
+        self.data.qpos[3:7] = quat
 
-        joint_noise = rng.normal(0.0, 0.22, size=self.n_joints)
+        joint_noise = rng.normal(0.0, 0.05 + 0.20 * difficulty, size=self.n_joints)
         self.data.qpos[-self.n_joints :] = np.clip(self.standing_ctrl + joint_noise, self.ctrl_low, self.ctrl_high)
-        self.data.qvel[:6] = rng.normal(0.0, 0.25, size=6)
-        self.data.qvel[-self.n_joints :] = rng.normal(0.0, 0.6, size=self.n_joints)
+        self.data.qvel[:6] = rng.normal(0.0, 0.05 + 0.25 * difficulty, size=6)
+        self.data.qvel[-self.n_joints :] = rng.normal(0.0, 0.10 + 0.60 * difficulty, size=self.n_joints)
         self.data.ctrl[: self.n_joints] = self.standing_ctrl
         mujoco.mj_forward(self.model, self.data)
         self._raise_robot_above_terrain(clearance=0.03)
@@ -350,7 +424,29 @@ class UnitreeA1Env(gym.Env):
         ji = self._get_joint_indices()
         joint_pos = qpos[ji].copy()
         joint_vel = qvel[ji].copy()
-        return np.concatenate([quat, ang_vel, lin_vel, height_error, joint_pos, joint_vel]).astype(np.float32)
+        return np.concatenate(
+            [quat, ang_vel, lin_vel, height_error, joint_pos, joint_vel, self.last_action]
+        ).astype(np.float32)
+
+    def _normalize_obs(self, obs, update=True):
+        if self.obs_normalizer is None:
+            return obs
+        return self.obs_normalizer.normalize(obs, update=update)
+
+    def _posture_metrics(self):
+        terrain_z = self._terrain_height_under_base()
+        target_z = terrain_z + self.nominal_base_clearance
+        z = float(self.data.qpos[2])
+        upright = self._upright_score()
+        height_error = z - target_z
+        return terrain_z, target_z, z, upright, height_error
+
+    def _reset_progress_trackers(self):
+        _, _, _, upright, height_error = self._posture_metrics()
+        self.success_steps = 0
+        self.failure_steps = 0
+        self.prev_upright = float(upright)
+        self.prev_abs_height_error = abs(float(height_error))
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -366,13 +462,23 @@ class UnitreeA1Env(gym.Env):
             self._apply_recovery_randomization()
 
         mujoco.mj_forward(self.model, self.data)
+        _, _, _, initial_upright, initial_height_error = self._posture_metrics()
+        self.initial_upright = float(initial_upright)
+        self.initial_height_error = float(initial_height_error)
+        self._reset_progress_trackers()
         obs = self._get_obs_raw()
-        obs = self.obs_normalizer.normalize(obs, update=True)
+        obs = self._normalize_obs(obs, update=True)
         info = {
             "task": task,
             "recovery_reset": use_recovery,
             "z": float(self.data.qpos[2]),
             "upright": self._upright_score(),
+            "initial_upright": self.initial_upright,
+            "initial_height_error": self.initial_height_error,
+            "hard_reset_sampled": self.hard_reset_sampled,
+            "recovery_difficulty": self.current_recovery_difficulty,
+            "recovery_difficulty_min": self.recovery_difficulty_min,
+            "recovery_difficulty_max": self.recovery_difficulty_max,
         }
         return obs, info
 
@@ -383,9 +489,7 @@ class UnitreeA1Env(gym.Env):
         target = self.standing_ctrl + self.action_scale * action
         target = np.clip(target, self.ctrl_low, self.ctrl_high)
 
-        ji = self._get_joint_indices()
-        qvel = np.array(self.data.qvel)
-        curr_vel = qvel[ji]
+        prev_action = self.last_action.copy()
 
         # XML position actuators apply their own PD internally from these angle targets.
         nctrl = min(len(self.data.ctrl), len(target))
@@ -395,48 +499,102 @@ class UnitreeA1Env(gym.Env):
             mujoco.mj_step(self.model, self.data)
         self.steps += 1
 
-        obs_raw = self._get_obs_raw()
-        obs = self.obs_normalizer.normalize(obs_raw, update=True)
-
-        terrain_z = self._terrain_height_under_base()
-        target_z = terrain_z + self.nominal_base_clearance
-        z = float(self.data.qpos[2])
-        upright = self._upright_score()
+        terrain_z, target_z, z, upright, height_error = self._posture_metrics()
+        abs_height_error = abs(float(height_error))
+        upright_progress = float(upright - self.prev_upright)
+        height_progress = float(self.prev_abs_height_error - abs_height_error)
         height_error = z - target_z
         ang_vel = np.asarray(self.data.qvel[3:6])
         lin_vel = np.asarray(self.data.qvel[:3])
+        joint_vel = np.asarray(self.data.qvel[-self.n_joints :])
         joint_error = np.asarray(self.data.qpos[-self.n_joints :]) - self.standing_ctrl
 
-        upright_reward = 1.5 * np.clip(upright, -1.0, 1.0)
-        height_reward = 1.0 * np.exp(-12.0 * height_error * height_error)
-        stillness_reward = 0.5 * np.exp(-1.5 * float(np.dot(lin_vel, lin_vel)))
-        pose_penalty = 0.15 * float(np.mean(np.square(joint_error)))
-        joint_vel_penalty = 0.02 * float(np.mean(np.square(curr_vel)))
-        ang_vel_penalty = 0.03 * float(np.dot(ang_vel, ang_vel))
-        action_penalty = 0.02 * float(np.mean(np.square(action)))
-        smooth_penalty = 0.01 * float(np.mean(np.square(action - self.last_action)))
+        upright_reward = 2.0 * np.clip((upright + 1.0) * 0.5, 0.0, 1.0)
+        height_reward = 2.5 * np.exp(-30.0 * height_error * height_error)
+        low_height_margin = max(0.0, target_z - z - 0.02)
+        low_height_penalty = 15.0 * low_height_margin + 30.0 * low_height_margin * low_height_margin
+        progress_reward = (
+            4.0 * np.clip(upright_progress, -0.05, 0.05)
+            + 5.0 * np.clip(height_progress, -0.05, 0.05)
+        )
+        righting_progress_reward = 0.0
+        if upright < 0.5:
+            righting_progress_reward = 8.0 * np.clip(upright_progress, 0.0, 0.08)
+        stillness_reward = 0.05 * np.exp(-0.5 * float(np.dot(lin_vel, lin_vel)))
+        pose_penalty = 0.05 * float(np.mean(np.square(joint_error)))
+        joint_vel_penalty = 0.005 * float(np.mean(np.square(joint_vel)))
+        ang_vel_penalty = 0.02 * float(np.dot(ang_vel, ang_vel))
+        action_penalty = 0.005 * float(np.mean(np.square(action)))
+        smooth_penalty = 0.002 * float(np.mean(np.square(action - prev_action)))
+
+        stable = bool(
+            upright > 0.88
+            and abs_height_error < 0.065
+            and float(np.linalg.norm(ang_vel)) < 1.5
+            and float(np.linalg.norm(lin_vel[:2])) < 0.8
+        )
+        if stable:
+            self.success_steps += 1
+        else:
+            self.success_steps = 0
+
+        fallen = bool(z < terrain_z + 0.06 or upright < -0.35)
+        catastrophic = bool(z < terrain_z - 0.08)
+        effective_failure_steps_limit = self.failure_steps_limit
+        if self.initial_upright < 0.5:
+            effective_failure_steps_limit = int(round(1.5 * self.failure_steps_limit))
+        making_progress = bool(upright_progress > 0.002 or height_progress > 0.001)
+        if fallen and not making_progress:
+            self.failure_steps += 1
+        else:
+            self.failure_steps = max(0, self.failure_steps - 1)
+
+        recovered = bool(self.success_steps >= self.success_steps_required)
+        failure_timeout = bool(self.failure_steps >= effective_failure_steps_limit)
+        time_fraction = min(float(self.steps) / max(float(self.max_episode_steps), 1.0), 1.0)
+        success_reward = 6.0 if stable else 0.0
+        fallen_penalty = 1.0 if fallen else 0.0
+        unrecovered_time_penalty = 0.0 if stable else 0.01 + 0.12 * time_fraction
         reward = (
             upright_reward
             + height_reward
+            + progress_reward
+            + righting_progress_reward
             + stillness_reward
+            + success_reward
             - pose_penalty
             - joint_vel_penalty
             - ang_vel_penalty
             - action_penalty
             - smooth_penalty
+            - fallen_penalty
+            - low_height_penalty
+            - unrecovered_time_penalty
         )
 
         self.last_action = action.copy()
-
-        fallen = bool(z < terrain_z + 0.06 or upright < -0.35)
-        catastrophic = bool(z < terrain_z - 0.08)
         if self.current_task == "recovery":
-            terminated = catastrophic
+            terminated = bool(catastrophic or recovered or failure_timeout)
         else:
             terminated = fallen
         truncated = bool(self.steps >= self.max_episode_steps)
-        if fallen:
-            reward -= 2.0
+        episode_timeout = bool(self.current_task == "recovery" and truncated and not recovered)
+        terminal_reward = 0.0
+        if catastrophic:
+            terminal_reward = -40.0
+        elif failure_timeout:
+            terminal_reward = -40.0
+        elif recovered:
+            terminal_reward = 80.0 + 40.0 * (1.0 - time_fraction)
+        elif episode_timeout:
+            terminal_reward = -60.0
+        reward += terminal_reward
+
+        self.prev_upright = float(upright)
+        self.prev_abs_height_error = abs_height_error
+
+        obs_raw = self._get_obs_raw()
+        obs = self._normalize_obs(obs_raw, update=True)
 
         info = {
             "z": z,
@@ -445,8 +603,27 @@ class UnitreeA1Env(gym.Env):
             "height_error": height_error,
             "fallen": fallen,
             "catastrophic": catastrophic,
+            "stable": stable,
+            "recovered": recovered,
+            "failure_timeout": failure_timeout,
+            "episode_timeout": episode_timeout,
+            "initial_upright": self.initial_upright,
+            "initial_height_error": self.initial_height_error,
+            "hard_reset_sampled": self.hard_reset_sampled,
+            "success_steps": self.success_steps,
+            "failure_steps": self.failure_steps,
+            "failure_steps_limit": effective_failure_steps_limit,
+            "recovery_difficulty": self.current_recovery_difficulty,
+            "recovery_difficulty_min": self.recovery_difficulty_min,
+            "recovery_difficulty_max": self.recovery_difficulty_max,
             "reward_upright": upright_reward,
             "reward_height": height_reward,
+            "reward_low_height_penalty": low_height_penalty,
+            "reward_time_penalty": unrecovered_time_penalty,
+            "reward_progress": progress_reward,
+            "reward_righting_progress": righting_progress_reward,
+            "reward_success": success_reward,
+            "reward_terminal": terminal_reward,
         }
         return obs, float(reward), terminated, truncated, info
 

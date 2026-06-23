@@ -15,7 +15,11 @@ from envs import UnitreeA1Env
 
 def current_obs(env):
     obs = env._get_obs_raw()
-    return env.obs_normalizer.normalize(obs, update=False)
+    if hasattr(env, "_normalize_obs"):
+        return env._normalize_obs(obs, update=False)
+    if getattr(env, "obs_normalizer", None) is not None:
+        return env.obs_normalizer.normalize(obs, update=False)
+    return obs
 
 
 def main():
@@ -26,6 +30,14 @@ def main():
     parser.add_argument("--seed", type=int, default=None, help="Reset seed for reproducible recovery poses")
     parser.add_argument("--stochastic", action="store_true", help="Sample actions instead of deterministic policy output")
     parser.add_argument("--auto-reset", action="store_true", help="Reset automatically when the env terminates/truncates")
+    parser.add_argument("--recovery-level", type=float, default=1.0, help="Recovery reset difficulty in [0, 1]")
+    parser.add_argument("--terrain-friction", type=float, default=0.12, help="Sliding friction for terrain/robot contacts")
+    parser.add_argument(
+        "--stance-forward-offset",
+        type=float,
+        default=0.0,
+        help="Forward foot-target offset used by standing IK, in meters",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.model):
@@ -33,7 +45,13 @@ def main():
     if args.checkpoint is not None and not os.path.exists(args.checkpoint):
         raise FileNotFoundError(f"找不到 checkpoint，请检查路径是否正确: {args.checkpoint}")
 
-    env = UnitreeA1Env(args.model, task=args.task)
+    env = UnitreeA1Env(
+        args.model,
+        task=args.task,
+        recovery_difficulty=args.recovery_level,
+        terrain_friction=args.terrain_friction,
+        stance_forward_offset=args.stance_forward_offset,
+    )
     obs, info = env.reset(seed=args.seed)
     policy = PPO.load(args.checkpoint, env=env) if args.checkpoint is not None else None
     action = np.zeros(env.action_space.shape, dtype=np.float32)

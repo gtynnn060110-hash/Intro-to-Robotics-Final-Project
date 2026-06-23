@@ -55,6 +55,7 @@ class WandbMetricsCallback(BaseCallback):
                 "height_error",
                 "fallen",
                 "catastrophic",
+                "recovery_level",
                 "reward_upright",
                 "reward_height",
             ]
@@ -76,12 +77,42 @@ class WandbMetricsCallback(BaseCallback):
         return True
 
 
-def make_env(model_path, seed, max_episode_steps):
+class RecoveryCurriculumCallback(BaseCallback):
+    def __init__(self, start_level, end_level, curriculum_steps, run=None, verbose=0):
+        super().__init__(verbose)
+        self.start_level = float(start_level)
+        self.end_level = float(end_level)
+        self.curriculum_steps = max(int(curriculum_steps), 1)
+        self.run = run
+        self.last_level = None
+
+    def _level(self):
+        progress = min(self.num_timesteps / self.curriculum_steps, 1.0)
+        return self.start_level + progress * (self.end_level - self.start_level)
+
+    def _on_training_start(self):
+        self._apply_level(force=True)
+
+    def _on_step(self):
+        self._apply_level()
+        return True
+
+    def _apply_level(self, force=False):
+        level = float(np.clip(self._level(), 0.0, 1.0))
+        if force or self.last_level is None or abs(level - self.last_level) >= 0.01:
+            self.training_env.env_method("set_recovery_level", level)
+            self.last_level = level
+            if self.run is not None:
+                self.run.log({"curriculum/recovery_level": level}, step=self.num_timesteps)
+
+
+def make_env(model_path, seed, max_episode_steps, recovery_level):
     def _init():
         env = UnitreeA1Env(
             model_path,
             task="recovery",
             max_episode_steps=max_episode_steps,
+            recovery_level=recovery_level,
         )
         env.reset(seed=seed)
         return Monitor(env)
@@ -103,6 +134,9 @@ def main():
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--wandb-log-interval", type=int, default=1000)
     parser.add_argument("--wandb-model-save-freq", type=int, default=50_000)
+    parser.add_argument("--curriculum-start-level", type=float, default=0.15)
+    parser.add_argument("--curriculum-end-level", type=float, default=1.0)
+    parser.add_argument("--curriculum-steps", type=int, default=1_500_000)
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -112,7 +146,7 @@ def main():
 
     env = DummyVecEnv(
         [
-            make_env(args.model, args.seed + i, args.max_episode_steps)
+            make_env(args.model, args.seed + i, args.max_episode_steps, args.curriculum_start_level)
             for i in range(args.n_envs)
         ]
     )
@@ -125,13 +159,17 @@ def main():
         "n_envs": args.n_envs,
         "algo": "PPO",
         "task": "recovery",
-        "n_steps": 1024,
-        "batch_size": 256,
+        "curriculum_start_level": args.curriculum_start_level,
+        "curriculum_end_level": args.curriculum_end_level,
+        "curriculum_steps": args.curriculum_steps,
+        "n_steps": 2048,
+        "batch_size": 512,
         "learning_rate": 3e-4,
         "gamma": 0.99,
         "gae_lambda": 0.95,
-        "clip_range": 0.2,
-        "ent_coef": 0.01,
+        "clip_range": 0.15,
+        "ent_coef": 0.005,
+        "net_arch": {"pi": [256, 256], "vf": [256, 256]},
     }
     run = wandb.init(
         project=args.wandb_project,
@@ -142,9 +180,7 @@ def main():
         monitor_gym=False,
         save_code=True,
     )
-    policy_kwargs = dict(
-    net_arch=dict(pi=[256, 256], vf=[256, 256]),
-    )
+    policy_kwargs = dict(net_arch=dict(pi=[256, 256], vf=[256, 256]))
     model = PPO(
         "MlpPolicy",
         env,
@@ -172,11 +208,17 @@ def main():
         model_save_freq=max(args.wandb_model_save_freq // args.n_envs, 1),
         verbose=2,
     )
+    curriculum_callback = RecoveryCurriculumCallback(
+        start_level=args.curriculum_start_level,
+        end_level=args.curriculum_end_level,
+        curriculum_steps=args.curriculum_steps,
+        run=run,
+    )
 
     try:
         model.learn(
             total_timesteps=args.total_steps,
-            callback=CallbackList([checkpoint_callback, wandb_callback]),
+            callback=CallbackList([curriculum_callback, checkpoint_callback, wandb_callback]),
         )
         model.save(str(run_dir / "ppo_recovery_stand_final"))
     finally:
