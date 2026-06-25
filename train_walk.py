@@ -1,6 +1,7 @@
 """Fine-tune a recovery checkpoint into a fixed-speed walking policy."""
 import argparse
 import os
+import pickle
 from pathlib import Path
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -8,6 +9,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
+import gymnasium as gym
 import numpy as np
 import torch
 from stable_baselines3 import PPO
@@ -31,10 +33,23 @@ INFO_KEYWORDS = (
     "vx",
     "vy",
     "yaw_rate",
+    "pitch_tilt",
+    "roll_tilt",
     "speed_error",
     "overspeed",
+    "reward_forward",
+    "reward_progress",
+    "reward_gait_contact",
+    "reward_gait_swing",
     "penalty_overspeed",
     "penalty_low_speed",
+    "penalty_stance_slip",
+    "penalty_backward",
+    "penalty_support",
+    "penalty_rear_air",
+    "penalty_stance_contact",
+    "penalty_pitch_tilt",
+    "penalty_roll_tilt",
     "distance",
     "mean_vx_episode",
     "stable_walk",
@@ -44,7 +59,78 @@ INFO_KEYWORDS = (
     "foot_contact_match",
     "swing_clearance_score",
     "stance_slip",
+    "support_count",
+    "rear_contact_count",
+    "stance_contact_miss",
+    "reward_teacher_action",
+    "teacher_action_error",
+    "teacher_reward_weight",
 )
+
+
+class TeacherActionRewardWrapper(gym.Wrapper):
+    """Keep PPO close to a frozen BC/SFT walking policy with action reward."""
+
+    def __init__(
+        self,
+        env,
+        teacher_checkpoint,
+        teacher_vecnormalize,
+        reward_weight=5.0,
+        action_error_scale=4.0,
+        deterministic=True,
+    ):
+        super().__init__(env)
+        self.reward_weight = float(max(reward_weight, 0.0))
+        self.action_error_scale = float(max(action_error_scale, 1e-8))
+        self.deterministic = bool(deterministic)
+        self._last_raw_obs = None
+
+        self.teacher = PPO.load(str(teacher_checkpoint), device="cpu")
+        self.teacher.policy.set_training_mode(False)
+
+        with open(teacher_vecnormalize, "rb") as f:
+            vecnormalize = pickle.load(f)
+        self._teacher_obs_mean = np.asarray(vecnormalize.obs_rms.mean, dtype=np.float32)
+        self._teacher_obs_var = np.asarray(vecnormalize.obs_rms.var, dtype=np.float32)
+        self._teacher_clip_obs = float(getattr(vecnormalize, "clip_obs", 10.0))
+        self._teacher_epsilon = float(getattr(vecnormalize, "epsilon", 1e-8))
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._last_raw_obs = np.asarray(obs, dtype=np.float32).copy()
+        return obs, info
+
+    def step(self, action):
+        teacher_action = self._predict_teacher_action()
+        action = np.asarray(action, dtype=np.float32)
+        action_error = float(np.mean(np.square(action - teacher_action)))
+        teacher_reward = self.reward_weight * float(np.exp(-self.action_error_scale * action_error))
+
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        info = dict(info)
+        info["reward_teacher_action"] = teacher_reward
+        info["teacher_action_error"] = action_error
+        info["teacher_reward_weight"] = self.reward_weight
+        self._last_raw_obs = np.asarray(obs, dtype=np.float32).copy()
+        return obs, float(reward + teacher_reward), terminated, truncated, info
+
+    def _predict_teacher_action(self):
+        if self._last_raw_obs is None:
+            raise RuntimeError("TeacherActionRewardWrapper.step() called before reset().")
+        obs = self._normalize_teacher_obs(self._last_raw_obs)
+        action, _ = self.teacher.predict(obs, deterministic=self.deterministic)
+        return np.asarray(action, dtype=np.float32).reshape(self.action_space.shape)
+
+    def _normalize_teacher_obs(self, obs):
+        if obs.shape != self._teacher_obs_mean.shape:
+            raise ValueError(
+                "Teacher observation stats do not match this environment: "
+                f"obs={obs.shape}, teacher={self._teacher_obs_mean.shape}. "
+                "Check that gait-clock/action settings match the BC run."
+            )
+        norm_obs = (obs - self._teacher_obs_mean) / np.sqrt(self._teacher_obs_var + self._teacher_epsilon)
+        return np.clip(norm_obs, -self._teacher_clip_obs, self._teacher_clip_obs).astype(np.float32)
 
 
 class WalkCurriculumCallback(BaseCallback):
@@ -146,6 +232,20 @@ class WalkMetricsCallback(BaseCallback):
             "upright": _mean_info(infos, "upright"),
             "height_error": _mean_info(infos, "height_error"),
             "fallen": _mean_info(infos, "fallen"),
+            "foot_contact": _mean_info(infos, "foot_contact_match"),
+            "swing": _mean_info(infos, "swing_clearance_score"),
+            "stance_slip": _mean_info(infos, "stance_slip"),
+            "support_count": _mean_info(infos, "support_count"),
+            "rear_contacts": _mean_info(infos, "rear_contact_count"),
+            "rear_air_penalty": _mean_info(infos, "penalty_rear_air"),
+            "stance_contact_miss": _mean_info(infos, "stance_contact_miss"),
+            "pitch_tilt": _mean_info(infos, "pitch_tilt"),
+            "roll_tilt": _mean_info(infos, "roll_tilt"),
+            "teacher_reward": _mean_info(infos, "reward_teacher_action"),
+            "teacher_action_error": _mean_info(infos, "teacher_action_error"),
+            "low_speed_penalty": _mean_info(infos, "penalty_low_speed"),
+            "pitch_penalty": _mean_info(infos, "penalty_pitch_tilt"),
+            "roll_penalty": _mean_info(infos, "penalty_roll_tilt"),
         }
         if recent:
             payload.update(
@@ -194,6 +294,8 @@ def make_env(
     low_height_penalty_quadratic_weight,
     lateral_penalty_weight,
     yaw_penalty_weight,
+    pitch_tilt_penalty_weight,
+    roll_tilt_penalty_weight,
     ang_vel_penalty_weight,
     joint_vel_penalty_weight,
     pose_penalty_weight,
@@ -209,12 +311,22 @@ def make_env(
     swing_clearance_weight,
     stance_slip_weight,
     gait_symmetry_weight,
+    support_clearance_threshold,
+    min_support_contacts,
+    support_penalty_weight,
+    rear_air_penalty_weight,
+    stance_contact_penalty_weight,
     gait_clock_obs,
     use_trot_reference,
     trot_frequency,
     trot_thigh_amplitude,
     trot_calf_amplitude,
     trot_stance_calf_amplitude,
+    teacher_checkpoint,
+    teacher_vecnormalize,
+    teacher_reward_weight,
+    teacher_action_error_scale,
+    teacher_deterministic,
 ):
     def _init():
         env = UnitreeA1WalkEnv(
@@ -242,6 +354,8 @@ def make_env(
             low_height_penalty_quadratic_weight=low_height_penalty_quadratic_weight,
             lateral_penalty_weight=lateral_penalty_weight,
             yaw_penalty_weight=yaw_penalty_weight,
+            pitch_tilt_penalty_weight=pitch_tilt_penalty_weight,
+            roll_tilt_penalty_weight=roll_tilt_penalty_weight,
             ang_vel_penalty_weight=ang_vel_penalty_weight,
             joint_vel_penalty_weight=joint_vel_penalty_weight,
             pose_penalty_weight=pose_penalty_weight,
@@ -255,6 +369,11 @@ def make_env(
             swing_clearance_weight=swing_clearance_weight,
             stance_slip_weight=stance_slip_weight,
             gait_symmetry_weight=gait_symmetry_weight,
+            support_clearance_threshold=support_clearance_threshold,
+            min_support_contacts=min_support_contacts,
+            support_penalty_weight=support_penalty_weight,
+            rear_air_penalty_weight=rear_air_penalty_weight,
+            stance_contact_penalty_weight=stance_contact_penalty_weight,
             gait_clock_obs=gait_clock_obs,
             use_trot_reference=use_trot_reference,
             trot_frequency=trot_frequency,
@@ -263,8 +382,21 @@ def make_env(
             trot_stance_calf_amplitude=trot_stance_calf_amplitude,
             normalize_obs=False,
         )
+        teacher_enabled = bool(teacher_checkpoint and teacher_reward_weight > 0.0)
+        if teacher_enabled:
+            env = TeacherActionRewardWrapper(
+                env,
+                teacher_checkpoint=teacher_checkpoint,
+                teacher_vecnormalize=teacher_vecnormalize,
+                reward_weight=teacher_reward_weight,
+                action_error_scale=teacher_action_error_scale,
+                deterministic=teacher_deterministic,
+            )
         env.reset(seed=seed)
-        return Monitor(env, info_keywords=INFO_KEYWORDS)
+        info_keywords = INFO_KEYWORDS
+        if not teacher_enabled:
+            info_keywords = tuple(key for key in INFO_KEYWORDS if not key.startswith("teacher_") and key != "reward_teacher_action")
+        return Monitor(env, info_keywords=info_keywords)
 
     return _init
 
@@ -274,6 +406,12 @@ def main():
     parser.add_argument("--model", default="unitree_a1/scene.xml")
     parser.add_argument("--resume-from", default=None)
     parser.add_argument("--vecnormalize-load", default=None)
+    parser.add_argument("--teacher-run-dir", default=None)
+    parser.add_argument("--teacher-checkpoint", default=None)
+    parser.add_argument("--teacher-vecnormalize", default=None)
+    parser.add_argument("--teacher-reward-weight", type=float, default=5.0)
+    parser.add_argument("--teacher-action-error-scale", type=float, default=4.0)
+    parser.add_argument("--teacher-deterministic", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--run-dir", default="runs/walk_from_prev_fresh_v1")
     parser.add_argument("--total-steps", type=int, default=1_000_000)
     parser.add_argument("--seed", type=int, default=0)
@@ -291,32 +429,39 @@ def main():
     parser.add_argument("--terrain-height-scale-end", type=float, default=0.3)
     parser.add_argument("--action-scale", type=float, default=0.5)
     parser.add_argument("--frame-skip", type=int, default=4)
-    parser.add_argument("--gait-frequency", type=float, default=1.15)
-    parser.add_argument("--swing-height", type=float, default=0.055)
+    parser.add_argument("--gait-frequency", type=float, default=0.95)
+    parser.add_argument("--swing-height", type=float, default=0.045)
     parser.add_argument("--stance-clearance", type=float, default=0.012)
     parser.add_argument("--foot-contact-weight", type=float, default=1.2)
-    parser.add_argument("--swing-clearance-weight", type=float, default=1.0)
+    parser.add_argument("--swing-clearance-weight", type=float, default=0.7)
     parser.add_argument("--stance-slip-weight", type=float, default=0.25)
     parser.add_argument("--gait-symmetry-weight", type=float, default=0.15)
+    parser.add_argument("--support-clearance-threshold", type=float, default=0.035)
+    parser.add_argument("--min-support-contacts", type=float, default=2.0)
+    parser.add_argument("--support-penalty-weight", type=float, default=5.0)
+    parser.add_argument("--rear-air-penalty-weight", type=float, default=8.0)
+    parser.add_argument("--stance-contact-penalty-weight", type=float, default=2.0)
     parser.add_argument("--gait-clock-obs", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overspeed-deadband", type=float, default=0.02)
     parser.add_argument("--overspeed-weight", type=float, default=8.0)
     parser.add_argument("--overspeed-quadratic-weight", type=float, default=20.0)
     parser.add_argument("--forward-reward-weight", type=float, default=3.0)
-    parser.add_argument("--progress-reward-weight", type=float, default=1.5)
+    parser.add_argument("--progress-reward-weight", type=float, default=0.8)
     parser.add_argument("--backward-penalty-weight", type=float, default=2.0)
-    parser.add_argument("--low-speed-penalty-weight", type=float, default=0.0)
-    parser.add_argument("--low-speed-fraction", type=float, default=0.6)
-    parser.add_argument("--speed-reward-sharpness", type=float, default=4.0)
+    parser.add_argument("--low-speed-penalty-weight", type=float, default=80.0)
+    parser.add_argument("--low-speed-fraction", type=float, default=0.9)
+    parser.add_argument("--speed-reward-sharpness", type=float, default=25.0)
     parser.add_argument("--upright-reward-weight", type=float, default=1.5)
     parser.add_argument("--height-reward-weight", type=float, default=1.5)
     parser.add_argument("--height-reward-sharpness", type=float, default=30.0)
     parser.add_argument("--height-target-offset", type=float, default=0.0)
     parser.add_argument("--low-height-penalty-weight", type=float, default=0.0)
     parser.add_argument("--low-height-penalty-quadratic-weight", type=float, default=0.0)
-    parser.add_argument("--lateral-penalty-weight", type=float, default=1.0)
-    parser.add_argument("--yaw-penalty-weight", type=float, default=0.20)
-    parser.add_argument("--ang-vel-penalty-weight", type=float, default=0.04)
+    parser.add_argument("--lateral-penalty-weight", type=float, default=2.5)
+    parser.add_argument("--yaw-penalty-weight", type=float, default=0.6)
+    parser.add_argument("--pitch-tilt-penalty-weight", type=float, default=8.0)
+    parser.add_argument("--roll-tilt-penalty-weight", type=float, default=5.0)
+    parser.add_argument("--ang-vel-penalty-weight", type=float, default=0.06)
     parser.add_argument("--joint-vel-penalty-weight", type=float, default=0.003)
     parser.add_argument("--pose-penalty-weight", type=float, default=0.03)
     parser.add_argument("--action-penalty-weight", type=float, default=0.004)
@@ -330,8 +475,36 @@ def main():
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--log-interval", type=int, default=10_000)
     parser.add_argument("--checkpoint-save-freq", type=int, default=100_000)
+    parser.add_argument("--norm-reward", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reset-num-timesteps", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
+
+    if args.teacher_run_dir:
+        teacher_run_dir = Path(args.teacher_run_dir)
+        if args.teacher_checkpoint is None:
+            args.teacher_checkpoint = str(teacher_run_dir / "ppo_walk_bc_pretrained.zip")
+        if args.teacher_vecnormalize is None:
+            args.teacher_vecnormalize = str(teacher_run_dir / "vecnormalize.pkl")
+    if args.teacher_checkpoint and args.teacher_vecnormalize is None:
+        raise ValueError("--teacher-vecnormalize is required when --teacher-checkpoint is set.")
+    if args.teacher_checkpoint is None:
+        args.teacher_reward_weight = 0.0
+    elif args.teacher_reward_weight <= 0.0:
+        print("[walk] teacher checkpoint provided but teacher reward weight <= 0; teacher regularization is disabled.")
+    else:
+        if not Path(args.teacher_checkpoint).exists():
+            raise FileNotFoundError(args.teacher_checkpoint)
+        if not Path(args.teacher_vecnormalize).exists():
+            raise FileNotFoundError(args.teacher_vecnormalize)
+        if args.n_envs > 1 and args.start_method == "fork":
+            args.start_method = "forkserver"
+            print("[walk] teacher regularization is not fork-safe; using start_method=forkserver.", flush=True)
+        print(
+            "[walk] teacher regularization enabled "
+            f"checkpoint={args.teacher_checkpoint} vecnormalize={args.teacher_vecnormalize} "
+            f"weight={args.teacher_reward_weight:.3f} scale={args.teacher_action_error_scale:.3f}",
+            flush=True,
+        )
 
     torch.set_num_threads(max(int(args.torch_threads), 1))
     torch.set_num_interop_threads(1)
@@ -366,6 +539,8 @@ def main():
             low_height_penalty_quadratic_weight=args.low_height_penalty_quadratic_weight,
             lateral_penalty_weight=args.lateral_penalty_weight,
             yaw_penalty_weight=args.yaw_penalty_weight,
+            pitch_tilt_penalty_weight=args.pitch_tilt_penalty_weight,
+            roll_tilt_penalty_weight=args.roll_tilt_penalty_weight,
             ang_vel_penalty_weight=args.ang_vel_penalty_weight,
             joint_vel_penalty_weight=args.joint_vel_penalty_weight,
             pose_penalty_weight=args.pose_penalty_weight,
@@ -381,12 +556,22 @@ def main():
             swing_clearance_weight=args.swing_clearance_weight,
             stance_slip_weight=args.stance_slip_weight,
             gait_symmetry_weight=args.gait_symmetry_weight,
+            support_clearance_threshold=args.support_clearance_threshold,
+            min_support_contacts=args.min_support_contacts,
+            support_penalty_weight=args.support_penalty_weight,
+            rear_air_penalty_weight=args.rear_air_penalty_weight,
+            stance_contact_penalty_weight=args.stance_contact_penalty_weight,
             gait_clock_obs=args.gait_clock_obs,
             use_trot_reference=args.use_trot_reference,
             trot_frequency=args.trot_frequency,
             trot_thigh_amplitude=args.trot_thigh_amplitude,
             trot_calf_amplitude=args.trot_calf_amplitude,
             trot_stance_calf_amplitude=args.trot_stance_calf_amplitude,
+            teacher_checkpoint=args.teacher_checkpoint,
+            teacher_vecnormalize=args.teacher_vecnormalize,
+            teacher_reward_weight=args.teacher_reward_weight,
+            teacher_action_error_scale=args.teacher_action_error_scale,
+            teacher_deterministic=args.teacher_deterministic,
         )
         for i in range(args.n_envs)
     ]
@@ -398,9 +583,9 @@ def main():
     if args.vecnormalize_load:
         env = VecNormalize.load(args.vecnormalize_load, env)
         env.training = True
-        env.norm_reward = False
+        env.norm_reward = bool(args.norm_reward)
     else:
-        env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
+        env = VecNormalize(env, norm_obs=True, norm_reward=bool(args.norm_reward), clip_obs=10.0)
 
     if args.resume_from:
         model = PPO.load(args.resume_from, env=env, seed=args.seed, verbose=1)

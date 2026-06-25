@@ -28,14 +28,19 @@ class UnitreeA1WalkEnv(UnitreeA1Env):
         reset_noise: float = 0.0,
         terrain_friction: float = 1.5,
         terrain_height_scale: float | None = None,
-        gait_frequency: float = 1.15,
+        gait_frequency: float = 0.95,
         randomize_gait_phase: bool = True,
-        swing_height: float = 0.055,
+        swing_height: float = 0.045,
         stance_clearance: float = 0.012,
         foot_contact_weight: float = 1.2,
-        swing_clearance_weight: float = 1.0,
+        swing_clearance_weight: float = 0.7,
         stance_slip_weight: float = 0.25,
         gait_symmetry_weight: float = 0.15,
+        support_clearance_threshold: float = 0.035,
+        min_support_contacts: float = 2.0,
+        support_penalty_weight: float = 5.0,
+        rear_air_penalty_weight: float = 8.0,
+        stance_contact_penalty_weight: float = 2.0,
         overspeed_deadband: float = 0.03,
         overspeed_weight: float = 6.0,
         overspeed_quadratic_weight: float = 16.0,
@@ -53,6 +58,8 @@ class UnitreeA1WalkEnv(UnitreeA1Env):
         low_height_penalty_quadratic_weight: float = 18.0,
         lateral_penalty_weight: float = 1.0,
         yaw_penalty_weight: float = 0.25,
+        pitch_tilt_penalty_weight: float = 6.0,
+        roll_tilt_penalty_weight: float = 4.0,
         ang_vel_penalty_weight: float = 0.035,
         joint_vel_penalty_weight: float = 0.0025,
         pose_penalty_weight: float = 0.02,
@@ -90,6 +97,11 @@ class UnitreeA1WalkEnv(UnitreeA1Env):
         self.swing_clearance_weight = float(max(swing_clearance_weight, 0.0))
         self.stance_slip_weight = float(max(stance_slip_weight, 0.0))
         self.gait_symmetry_weight = float(max(gait_symmetry_weight, 0.0))
+        self.support_clearance_threshold = float(max(support_clearance_threshold, 0.0))
+        self.min_support_contacts = float(max(min_support_contacts, 0.0))
+        self.support_penalty_weight = float(max(support_penalty_weight, 0.0))
+        self.rear_air_penalty_weight = float(max(rear_air_penalty_weight, 0.0))
+        self.stance_contact_penalty_weight = float(max(stance_contact_penalty_weight, 0.0))
 
         self.overspeed_deadband = float(max(overspeed_deadband, 0.0))
         self.overspeed_weight = float(max(overspeed_weight, 0.0))
@@ -108,6 +120,8 @@ class UnitreeA1WalkEnv(UnitreeA1Env):
         self.low_height_penalty_quadratic_weight = float(max(low_height_penalty_quadratic_weight, 0.0))
         self.lateral_penalty_weight = float(max(lateral_penalty_weight, 0.0))
         self.yaw_penalty_weight = float(max(yaw_penalty_weight, 0.0))
+        self.pitch_tilt_penalty_weight = float(max(pitch_tilt_penalty_weight, 0.0))
+        self.roll_tilt_penalty_weight = float(max(roll_tilt_penalty_weight, 0.0))
         self.ang_vel_penalty_weight = float(max(ang_vel_penalty_weight, 0.0))
         self.joint_vel_penalty_weight = float(max(joint_vel_penalty_weight, 0.0))
         self.pose_penalty_weight = float(max(pose_penalty_weight, 0.0))
@@ -162,6 +176,8 @@ class UnitreeA1WalkEnv(UnitreeA1Env):
             return -1
 
     def _configure_terrain(self):
+        for geom_id in self._robot_collision_geom_ids:
+            self.model.geom_friction[geom_id, 0] = self.terrain_friction
         if self._terrain_geom >= 0:
             self.model.geom_friction[self._terrain_geom, 0] = self.terrain_friction
             self.model.geom_friction[self._terrain_geom, 1] = 0.01
@@ -300,6 +316,9 @@ class UnitreeA1WalkEnv(UnitreeA1Env):
         self.gait_phase = float((self.gait_phase + 2.0 * np.pi * self.gait_frequency * dt) % (2.0 * np.pi))
 
         terrain_z, target_z, z, upright, _ = self._posture_metrics()
+        body_z_axis = self._body_z_axis(self.data.qpos[3:7])
+        pitch_tilt = float(body_z_axis[0])
+        roll_tilt = float(body_z_axis[1])
         lin_vel = np.asarray(self.data.qvel[:3], dtype=np.float64)
         ang_vel = np.asarray(self.data.qvel[3:6], dtype=np.float64)
         joint_vel = np.asarray(self.data.qvel[-self.n_joints :], dtype=np.float64)
@@ -324,6 +343,14 @@ class UnitreeA1WalkEnv(UnitreeA1Env):
             if np.any(stance_mask)
             else 0.0
         )
+        support_state = np.maximum(contacts, (clearances <= self.support_clearance_threshold).astype(np.float64))
+        support_count = float(np.sum(support_state))
+        support_deficit = max(0.0, self.min_support_contacts - support_count)
+        support_penalty = self.support_penalty_weight * support_deficit * support_deficit
+        rear_contact_count = float(np.sum(support_state[2:4])) if len(support_state) >= 4 else support_count
+        rear_air_penalty = self.rear_air_penalty_weight if rear_contact_count < 0.5 else 0.0
+        stance_contact_miss = float(np.mean(1.0 - support_state[stance_mask])) if np.any(stance_mask) else 0.0
+        stance_contact_penalty = self.stance_contact_penalty_weight * stance_contact_miss
         diagonal_a = float(abs(clearances[0] - clearances[3])) if len(clearances) >= 4 else 0.0
         diagonal_b = float(abs(clearances[1] - clearances[2])) if len(clearances) >= 4 else 0.0
         gait_symmetry_penalty = diagonal_a + diagonal_b
@@ -338,6 +365,8 @@ class UnitreeA1WalkEnv(UnitreeA1Env):
         low_height_penalty = self.low_height_penalty_weight * low_height_margin + self.low_height_penalty_quadratic_weight * low_height_margin * low_height_margin
         lateral_penalty = self.lateral_penalty_weight * vy * vy
         yaw_penalty = self.yaw_penalty_weight * yaw_rate * yaw_rate
+        pitch_tilt_penalty = self.pitch_tilt_penalty_weight * pitch_tilt * pitch_tilt
+        roll_tilt_penalty = self.roll_tilt_penalty_weight * roll_tilt * roll_tilt
         ang_vel_penalty = self.ang_vel_penalty_weight * float(np.dot(ang_vel, ang_vel))
         joint_vel_penalty = self.joint_vel_penalty_weight * float(np.mean(np.square(joint_vel)))
         pose_penalty = self.pose_penalty_weight * float(np.mean(np.square(joint_error)))
@@ -367,6 +396,8 @@ class UnitreeA1WalkEnv(UnitreeA1Env):
             + gait_swing_reward
             - lateral_penalty
             - yaw_penalty
+            - pitch_tilt_penalty
+            - roll_tilt_penalty
             - ang_vel_penalty
             - joint_vel_penalty
             - pose_penalty
@@ -378,6 +409,9 @@ class UnitreeA1WalkEnv(UnitreeA1Env):
             - overspeed_penalty
             - stance_slip_penalty
             - symmetry_penalty
+            - support_penalty
+            - rear_air_penalty
+            - stance_contact_penalty
             - fall_penalty
             + terminal_reward
         )
@@ -396,8 +430,13 @@ class UnitreeA1WalkEnv(UnitreeA1Env):
             "reward_gait_swing": gait_swing_reward,
             "penalty_stance_slip": stance_slip_penalty,
             "penalty_gait_symmetry": symmetry_penalty,
+            "penalty_support": support_penalty,
+            "penalty_rear_air": rear_air_penalty,
+            "penalty_stance_contact": stance_contact_penalty,
             "penalty_lateral": lateral_penalty,
             "penalty_yaw": yaw_penalty,
+            "penalty_pitch_tilt": pitch_tilt_penalty,
+            "penalty_roll_tilt": roll_tilt_penalty,
             "penalty_ang_vel": ang_vel_penalty,
             "penalty_joint_vel": joint_vel_penalty,
             "penalty_pose": pose_penalty,
@@ -412,6 +451,11 @@ class UnitreeA1WalkEnv(UnitreeA1Env):
             "foot_contact_match": contact_reward,
             "swing_clearance_score": swing_reward,
             "stance_slip": stance_slip,
+            "support_count": support_count,
+            "rear_contact_count": rear_contact_count,
+            "stance_contact_miss": stance_contact_miss,
+            "pitch_tilt": pitch_tilt,
+            "roll_tilt": roll_tilt,
         }
         obs = self._normalize_obs(self._get_obs_raw(), update=True)
         info = self._walking_info(reward_terms, stable_walk, fallen, catastrophic, timeout)
@@ -439,6 +483,8 @@ class UnitreeA1WalkEnv(UnitreeA1Env):
             "vx": float(lin_vel[0]),
             "vy": float(lin_vel[1]),
             "yaw_rate": float(ang_vel[2]),
+            "pitch_tilt": float(self._body_z_axis(self.data.qpos[3:7])[0]),
+            "roll_tilt": float(self._body_z_axis(self.data.qpos[3:7])[1]),
             "speed_error": float(lin_vel[0] - self.target_vx),
             "overspeed": float(max(0.0, lin_vel[0] - self.target_vx - self.overspeed_deadband)),
             "distance": distance,

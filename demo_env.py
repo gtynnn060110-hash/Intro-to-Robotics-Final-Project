@@ -15,17 +15,71 @@ except Exception:
     mujoco = None
 
 from stable_baselines3 import PPO
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from envs import UnitreeA1Env
+from envs import UnitreeA1Env, UnitreeA1WalkEnv
 
 
-def current_obs(env):
+def current_obs(env, vecnormalize=None):
     obs = env._get_obs_raw()
+    if vecnormalize is not None:
+        return vecnormalize.normalize_obs(np.asarray(obs, dtype=np.float32).reshape(1, -1))
     if hasattr(env, "_normalize_obs"):
         return env._normalize_obs(obs, update=False)
     if getattr(env, "obs_normalizer", None) is not None:
         return env.obs_normalizer.normalize(obs, update=False)
     return obs
+
+
+def make_demo_env(args):
+    if args.task == "walk":
+        return UnitreeA1WalkEnv(
+            model_path=args.model,
+            target_vx=args.target_vx,
+            reset_noise=args.reset_noise,
+            terrain_friction=args.terrain_friction,
+            terrain_height_scale=args.terrain_height_scale,
+            max_episode_steps=args.steps,
+            action_scale=args.action_scale,
+            frame_skip=args.frame_skip,
+            gait_frequency=args.gait_frequency,
+            swing_height=args.swing_height,
+            stance_clearance=args.stance_clearance,
+            stance_slip_weight=args.stance_slip_weight,
+            support_clearance_threshold=args.support_clearance_threshold,
+            min_support_contacts=args.min_support_contacts,
+            support_penalty_weight=args.support_penalty_weight,
+            rear_air_penalty_weight=args.rear_air_penalty_weight,
+            stance_contact_penalty_weight=args.stance_contact_penalty_weight,
+            lateral_penalty_weight=args.lateral_penalty_weight,
+            yaw_penalty_weight=args.yaw_penalty_weight,
+            pitch_tilt_penalty_weight=args.pitch_tilt_penalty_weight,
+            roll_tilt_penalty_weight=args.roll_tilt_penalty_weight,
+            use_trot_reference=args.use_trot_reference,
+            normalize_obs=False,
+        )
+    return UnitreeA1Env(
+        args.model,
+        task=args.task,
+        recovery_difficulty=args.recovery_level,
+        max_episode_steps=args.steps,
+        action_scale=args.action_scale,
+        normalize_obs=False,
+    )
+
+
+def load_vecnormalize(path, args):
+    if path is None:
+        return None
+
+    def _init():
+        return Monitor(make_demo_env(args))
+
+    vec = VecNormalize.load(path, DummyVecEnv([_init]))
+    vec.training = False
+    vec.norm_reward = False
+    return vec
 
 
 def quat_from_yaw(yaw):
@@ -137,6 +191,11 @@ def write_video(frames, output_path, fps):
     if not frames:
         raise RuntimeError("No frames were captured for video export.")
 
+    output_path = os.fspath(output_path)
+    parent = os.path.dirname(output_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
     try:
         import imageio.v2 as imageio
 
@@ -245,12 +304,32 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="unitree_a1/scene.xml", help="Path to A1 model XML")
     parser.add_argument("--steps", type=int, default=500, help="Number of simulation steps")
-    parser.add_argument("--task", choices=["stand", "recovery"], default="stand")
+    parser.add_argument("--task", choices=["stand", "recovery", "walk"], default="stand")
     parser.add_argument("--checkpoint", default=None, help="Optional PPO checkpoint .zip to inspect")
+    parser.add_argument("--vecnormalize", default=None, help="Optional VecNormalize .pkl saved with the PPO checkpoint")
     parser.add_argument("--seed", type=int, default=None, help="Reset seed for reproducible recovery poses")
     parser.add_argument("--stochastic", action="store_true", help="Sample actions instead of deterministic policy output")
     parser.add_argument("--no-auto-reset", action="store_true", help="Keep stepping after termination/truncation")
     parser.add_argument("--recovery-level", type=float, default=1.0, help="Recovery reset difficulty in [0, 1]")
+    parser.add_argument("--target-vx", type=float, default=0.2, help="Target walking velocity for --task walk")
+    parser.add_argument("--reset-noise", type=float, default=0.0, help="Reset perturbation for --task walk")
+    parser.add_argument("--terrain-height-scale", type=float, default=0.3, help="Terrain hfield height scale for --task walk")
+    parser.add_argument("--action-scale", type=float, default=0.5, help="Joint target action scale")
+    parser.add_argument("--frame-skip", type=int, default=4, help="MuJoCo steps per policy step")
+    parser.add_argument("--gait-frequency", type=float, default=0.95)
+    parser.add_argument("--swing-height", type=float, default=0.045)
+    parser.add_argument("--stance-clearance", type=float, default=0.012)
+    parser.add_argument("--stance-slip-weight", type=float, default=0.25)
+    parser.add_argument("--support-clearance-threshold", type=float, default=0.035)
+    parser.add_argument("--min-support-contacts", type=float, default=2.0)
+    parser.add_argument("--support-penalty-weight", type=float, default=5.0)
+    parser.add_argument("--rear-air-penalty-weight", type=float, default=8.0)
+    parser.add_argument("--stance-contact-penalty-weight", type=float, default=2.0)
+    parser.add_argument("--lateral-penalty-weight", type=float, default=2.5)
+    parser.add_argument("--yaw-penalty-weight", type=float, default=0.6)
+    parser.add_argument("--pitch-tilt-penalty-weight", type=float, default=8.0)
+    parser.add_argument("--roll-tilt-penalty-weight", type=float, default=5.0)
+    parser.add_argument("--use-trot-reference", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--diagnose-yaw-slip", action="store_true", help="Compare zero-action drift at yaw=0 and yaw=180")
     parser.add_argument("--render", action="store_true", help="Render when used with diagnostic modes")
     parser.add_argument("--record-video", default=None, help="Export yaw-slip diagnostic video to an .mp4 path")
@@ -301,15 +380,12 @@ def main():
         return
     if args.checkpoint is not None and not os.path.exists(args.checkpoint):
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+    if args.vecnormalize is not None and not os.path.exists(args.vecnormalize):
+        raise FileNotFoundError(f"VecNormalize file not found: {args.vecnormalize}")
 
-    env = UnitreeA1Env(
-        args.model,
-        task=args.task,
-        recovery_difficulty=args.recovery_level,
-        terrain_friction=args.terrain_friction,
-        stance_forward_offset=args.stance_forward_offset,
-    )
-    policy = PPO.load(args.checkpoint, env=env) if args.checkpoint is not None else None
+    env = make_demo_env(args)
+    vecnormalize = load_vecnormalize(args.vecnormalize, args)
+    policy = PPO.load(args.checkpoint, device="cpu") if args.checkpoint is not None else None
     obs, info = env.reset(seed=args.seed)
     print("Reset obs shape:", obs.shape)
     print("Reset info:", info)
@@ -319,32 +395,71 @@ def main():
         print(f"Control mode: PPO checkpoint={args.checkpoint}")
         print(f"Action mode: {'stochastic' if args.stochastic else 'deterministic'}")
 
+    renderer = None
+    video_frames = []
+    video_capture_interval = 1
+    if args.record_video is not None:
+        env.model.vis.global_.offwidth = max(int(env.model.vis.global_.offwidth), int(args.video_width))
+        env.model.vis.global_.offheight = max(int(env.model.vis.global_.offheight), int(args.video_height))
+        renderer = mujoco.Renderer(env.model, height=args.video_height, width=args.video_width)
+        dt = float(env.model.opt.timestep * env.frame_skip)
+        video_capture_interval = max(1, int(round(1.0 / max(dt * args.video_fps, 1e-8))))
+        renderer.update_scene(env.data)
+        video_frames.append(renderer.render().copy())
+        print(
+            f"Recording video to {args.record_video} "
+            f"({args.video_width}x{args.video_height}@{args.video_fps}fps)",
+            flush=True,
+        )
+
     try:
         for i in range(args.steps):
             if policy is None:
                 action = env.action_space.sample() * 0.0  # zero/stand action
             else:
-                obs = current_obs(env)
+                obs = current_obs(env, vecnormalize)
                 action, _ = policy.predict(obs, deterministic=not args.stochastic)
+                action = np.asarray(action, dtype=np.float32).reshape(env.action_space.shape)
             obs, reward, terminated, truncated, info = env.step(action)
             if i % 50 == 0:
                 print(
                     f"step={i} reward={reward:.3f} z={info.get('z', None):.3f} "
                     f"upright={info.get('upright', 0.0):.3f} "
                     f"height_error={info.get('height_error', 0.0):.3f} "
+                    f"vx={info.get('vx', 0.0):.3f} "
+                    f"pitch={info.get('pitch_tilt', 0.0):.3f} "
+                    f"roll={info.get('roll_tilt', 0.0):.3f} "
+                    f"stance_slip={info.get('stance_slip', 0.0):.3f} "
+                    f"support={info.get('support_count', 0.0):.1f} "
+                    f"rear={info.get('rear_contact_count', 0.0):.1f} "
+                    f"contact={info.get('foot_contact_match', 0.0):.3f} "
                     f"fallen={info.get('fallen', False)}"
                 )
-            # render human viewer if available
-            try:
-                env.render(mode="human")
-            except Exception:
-                pass
-            time.sleep(1.0 / 60.0)
+            if renderer is not None and i % video_capture_interval == 0:
+                renderer.update_scene(env.data)
+                video_frames.append(renderer.render().copy())
+            if args.render:
+                try:
+                    env.render(mode="human")
+                except Exception:
+                    pass
+                time.sleep(1.0 / 60.0)
             if (terminated or truncated) and not args.no_auto_reset:
                 print(f"episode ended at step={i} terminated={terminated} truncated={truncated}")
                 obs, info = env.reset(seed=args.seed)
                 print("Reset info:", info)
+                if renderer is not None:
+                    renderer.update_scene(env.data)
+                    video_frames.append(renderer.render().copy())
     finally:
+        if renderer is not None:
+            try:
+                write_video(video_frames, args.record_video, args.video_fps)
+                print(f"视频已导出: {args.record_video}")
+            finally:
+                renderer.close()
+        if vecnormalize is not None:
+            vecnormalize.close()
         env.close()
 
 
