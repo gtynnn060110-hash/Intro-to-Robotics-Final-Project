@@ -114,7 +114,10 @@ def make_eval_env(
             normalize_obs=False,
         )
         env.reset(seed=seed)
-        return Monitor(env, info_keywords=INFO_KEYWORDS)
+        info_keywords = tuple(
+            key for key in INFO_KEYWORDS if not key.startswith("teacher_") and key != "reward_teacher_action"
+        )
+        return Monitor(env, info_keywords=info_keywords)
 
     return _init
 
